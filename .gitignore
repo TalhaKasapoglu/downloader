@@ -1,0 +1,9 @@
+todo
+__pycache__
+downloads
+.direnv
+cookies.txt
+*.pyc
+*.pyo
+.env
+.history.db
