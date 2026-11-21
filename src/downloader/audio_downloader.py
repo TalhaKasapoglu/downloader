@@ -1,20 +1,25 @@
 import os
 import uuid
 import glob
+import base64
+import struct
 import subprocess
 import yt_dlp
 from .base import BaseDownloader
 from .utils import find_cookies_file
 
 class AudioDownloader(BaseDownloader):
-    # Supported codecs with their extensions and ffmpeg codec names
+    # Supported codecs with their file extensions and yt-dlp audio format names.
+    # 'format' is passed to yt-dlp's FFmpegExtractAudio as preferredcodec.
+    # yt-dlp expects a format name (e.g. 'opus'), not the raw FFmpeg encoder
+    # name (e.g. 'libopus') — using the latter raises KeyError: 'libopus'.
     CODECS = {
-        'aac':  {'ext': 'm4a', 'ffmpeg': 'aac'},
-        'mp3':  {'ext': 'mp3', 'ffmpeg': 'libmp3lame'},
-        'opus': {'ext': 'opus', 'ffmpeg': 'libopus'},
-        'flac': {'ext': 'flac', 'ffmpeg': 'flac'},
-        'vorbis': {'ext': 'ogg', 'ffmpeg': 'libvorbis'},
-        'wav':  {'ext': 'wav', 'ffmpeg': 'pcm_s16le'},
+        'aac':    {'ext': 'm4a',  'format': 'aac'},
+        'mp3':    {'ext': 'mp3',  'format': 'mp3'},
+        'opus':   {'ext': 'opus', 'format': 'opus'},
+        'flac':   {'ext': 'flac', 'format': 'flac'},
+        'vorbis': {'ext': 'ogg',  'format': 'vorbis'},
+        'wav':    {'ext': 'wav',  'format': 'wav'},
     }
 
     # Quality presets: maps quality label to bitrate (kbps)
@@ -40,14 +45,14 @@ class AudioDownloader(BaseDownloader):
         self._codec = codec
         self._ext = codec_info['ext']
         ext = self._ext
-        ffmpeg_codec = codec_info['ffmpeg']
+        ydl_format = codec_info['format']
         bitrate = self.QUALITY_BITRATES.get(quality, self.QUALITY_BITRATES['best'])
         print(f"Downloading Audio ({codec.upper()}, {bitrate}kbps) from: {url} (ID: {file_uuid})")
 
         postprocessors = [
             {
                 'key': 'FFmpegExtractAudio',
-                'preferredcodec': ffmpeg_codec,
+                'preferredcodec': ydl_format,
                 'preferredquality': bitrate,
             },
             {'key': 'FFmpegMetadata', 'add_chapters': True},
@@ -116,7 +121,13 @@ class AudioDownloader(BaseDownloader):
 
         temp_output = audio_path + f".temp.{ext}"
 
-        # For FLAC/WAV, thumbnail embedding is not well supported, skip
+        # Ogg containers (.opus/.ogg) cannot store an attached JPEG stream, but
+        # they support the METADATA_BLOCK_PICTURE Vorbis comment instead.
+        if ext in ('opus', 'ogg'):
+            self._embed_ogg_cover(audio_path, thumb_path, ext)
+            return
+
+        # FLAC/WAV have limited/unsupported thumbnail embedding
         if ext in ('flac', 'wav'):
             print(f"Thumbnail embedding skipped for {ext.upper()} format.")
             return
@@ -142,17 +153,78 @@ class AudioDownloader(BaseDownloader):
             if os.path.exists(temp_output):
                 os.remove(temp_output)
 
+    @staticmethod
+    def _picture_block_base64(thumb_path: str) -> str:
+        """Build a base64 FLAC picture block for METADATA_BLOCK_PICTURE.
+
+        Ogg/Opus cover art is stored as a Vorbis comment, not as an attached
+        picture stream. The comment value is a base64-encoded FLAC picture
+        metadata block (type 3 = front cover, image/jpeg).
+        """
+        dims = subprocess.check_output(
+            [
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height',
+                '-of', 'csv=p=0:s=x', thumb_path,
+            ],
+            text=True,
+        ).strip()
+        width, height = (int(v) for v in dims.split('x')[:2])
+
+        # WebP/PNG covers are converted to JPEG for maximum player support.
+        jpeg = subprocess.check_output(
+            [
+                'ffmpeg', '-v', 'error', '-i', thumb_path,
+                '-frames:v', '1', '-f', 'image2pipe', '-vcodec', 'mjpeg', '-',
+            ],
+            stderr=subprocess.PIPE,
+        )
+
+        be32 = lambda value: struct.pack('>I', value)
+        mime = b'image/jpeg'
+        block = (
+            be32(3)                  # picture type: front cover
+            + be32(len(mime)) + mime
+            + be32(0)                # empty description
+            + be32(width) + be32(height)
+            + be32(24)               # bits per pixel
+            + be32(0)                # number of colors (0 = unspecified)
+            + be32(len(jpeg)) + jpeg
+        )
+        return base64.b64encode(block).decode('ascii')
+
+    def _embed_ogg_cover(self, audio_path: str, thumb_path: str, ext: str):
+        """Embed cover art into .opus/.ogg via METADATA_BLOCK_PICTURE tag."""
+        temp_output = audio_path + f".temp.{ext}"
+        try:
+            picture = self._picture_block_base64(thumb_path)
+            cmd = [
+                'ffmpeg', '-y', '-loglevel', 'error',
+                '-i', audio_path,
+                '-c:a', 'copy',
+                '-metadata:s:a:0', f'METADATA_BLOCK_PICTURE={picture}',
+                temp_output,
+            ]
+            subprocess.run(cmd, check=True)
+            os.replace(temp_output, audio_path)
+            print("Thumbnail embedded successfully (METADATA_BLOCK_PICTURE).")
+        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+            print(f"Failed to embed thumbnail: {e}")
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+
     def cleanup_thumbnails(self, file_uuid: str):
-        # Look for image files containing the UUID in the output directory
-        extensions = ['*.jpg', '*.jpeg', '*.png', '*.webp']
-        for ext in extensions:
-            pattern = os.path.join(self.output_path, f"*{file_uuid}*{ext}")
-            for file_path in glob.glob(pattern):
-                try:
-                    os.remove(file_path)
-                    print(f"Cleaned up thumbnail: {file_path}")
-                except OSError as e:
-                    print(f"Failed to remove {file_path}: {e}")
+        """Remove every temporary file for this download except the audio."""
+        for file_path in glob.glob(os.path.join(self.output_path, f"*{file_uuid}*")):
+            # Keep only the final audio file (title-[uuid].ext); remove
+            # .webp/.jpg/.mp4/.part/.temp.* files and any other leftovers.
+            if file_path.endswith(f"-[{file_uuid}].{self._ext}"):
+                continue
+            try:
+                os.remove(file_path)
+                print(f"Cleaned up temporary file: {file_path}")
+            except OSError as e:
+                print(f"Failed to remove {file_path}: {e}")
 
     def finalize_filename(self, file_uuid: str):
         # Find audio file (try known extensions)
